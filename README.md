@@ -24,7 +24,7 @@
  ![WhatsApp Image 2025-07-06 at 7 43 06 PM (1)](https://github.com/user-attachments/assets/c748de00-6a6e-41dc-a6a8-c2ac6c95f688)
 
  
- ![WhatsApp Image 2025-07-06 at 7 43 05 PM (1)](https://github.com/user-attachments/assets/ebbb7b8b-1cd0-4662-a12a-69b49b0d9d2f)
+ 
 
 
  
