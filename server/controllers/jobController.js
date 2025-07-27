@@ -3,8 +3,9 @@ const axios = require("axios");
 const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const mongoose = require("mongoose");
 
-exports.createJob = async (req, res) => {
+const createJob = async (req, res) => {
   try {
     const { jobName, description } = req.body;
     const userId = req.user.id;
@@ -20,14 +21,13 @@ exports.createJob = async (req, res) => {
     const scriptPath = path.resolve(scriptFile.path);
     const ext = path.extname(scriptPath).toLowerCase();
 
-    // 🔮 Get ML prediction
     const predictionRes = await axios.post("http://localhost:8000/predict", {
       duration: 1,
     });
 
-    const { best_time, predicted_intensity } = predictionRes.data;
+    const { best_time, predicted_intensity, current_intensity } = predictionRes.data;
+    const carbonSaved = Math.max(current_intensity - predicted_intensity, 0); // ✅ Add this
 
-    // 🧠 Determine command based on file extension
     let command = "";
     switch (ext) {
       case ".js":
@@ -40,15 +40,13 @@ exports.createJob = async (req, res) => {
         const exePath = path.join(path.dirname(scriptPath), "a.out");
         command = `g++ "${scriptPath}" -o "${exePath}" && "${exePath}"`;
         break;
-        case ".sh":
+      case ".sh":
         command = `bash "${scriptPath}"`;
         break;
-        case ".ts":
-        command = `ts-node "${scriptPath}"`; // if ts-node is installed
+      case ".ts":
+        command = `ts-node "${scriptPath}"`;
         break;
-
       default:
-        // Not executable
         const job = new Job({
           userId,
           jobName,
@@ -57,6 +55,8 @@ exports.createJob = async (req, res) => {
           scheduledTime: best_time,
           scriptPath,
           carbonIntensity: predicted_intensity,
+          currentIntensity: current_intensity,
+          carbonSaved,
           output: `File type ${ext} is not executable. Saved but not run.`,
           status: "not-executed",
         });
@@ -69,23 +69,27 @@ exports.createJob = async (req, res) => {
         });
     }
 
-    // 🏃 Execute the script
     exec(command, async (error, stdout, stderr) => {
       try {
-        const job = new Job({
-          userId,
-          jobName,
-          description,
-          region: "IN-WE",
-          scheduledTime: best_time,
-          scriptPath,
-          carbonIntensity: predicted_intensity,
-          output: stdout || stderr,
-          status: error ? "failed" : "completed",
-         
-        });
+        const isFailed = error && error.code !== 0;
 
+const job = new Job({
+  userId,
+  jobName,
+  description,
+  region: "IN-WE",
+  scheduledTime: best_time,
+  scriptPath,
+  carbonIntensity: predicted_intensity,
+  currentIntensity: current_intensity,
+  carbonSaved,
+  output: stdout + stderr,
+  status: isFailed ? "failed" : "completed",
+});
+
+console.log("Saving job:", job);
         await job.save();
+        console.log(" Job saved successfully");
 
         res.status(201).json({
           success: true,
@@ -101,7 +105,7 @@ exports.createJob = async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("❌ Job creation error:", err);
+    console.error(" Job creation error:", err);
     res.status(500).json({
       success: false,
       message: "Error creating job",
@@ -109,40 +113,9 @@ exports.createJob = async (req, res) => {
     });
   }
 };
-exports.getUserStats = async (req, res) => {
-  try {
-    const jobs = await Job.find({ userId: req.user.id });
 
-    if (!jobs.length) {
-      return res.json({ totalJobs: 0, totalSaved: 0, avgSaved: 0 });
-    }
 
-    let totalSaved = 0;
-    let count = 0;
-
-    jobs.forEach(job => {
-      if (job.carbonIntensity) {
-        totalSaved += (400 - job.carbonIntensity); 
-        count++;
-      }
-    });
-
-    const avgSaved = count ? totalSaved / count : 0;
-
-    res.json({
-      totalJobs: jobs.length,
-      totalSaved: totalSaved.toFixed(2),
-      avgSaved: avgSaved.toFixed(2),
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: "Error fetching stats",
-      details: err.message,
-    });
-  }
-};
-
-exports.getUserJobs = async (req, res) => {
+const getUserJobs = async (req, res) => {
   try {
     const jobs = await Job.find({ userId: req.user.id }).sort({ createdAt: -1 });
     res.json({ jobs });
@@ -152,4 +125,46 @@ exports.getUserJobs = async (req, res) => {
       details: err.message,
     });
   }
+};
+
+
+const getUserStats = async (req, res) => {
+  try {
+    const userId = req.user._id || req.user.id || req.user.userId;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "User ID not found in request" });
+    }
+
+   
+    const jobs = await Job.find({ userId: new mongoose.Types.ObjectId(userId) });
+
+    const totalJobs = jobs.length;
+    const totalSaved = jobs.reduce((sum, job) => sum + (job.carbonSaved || 0), 0);
+    const avgSaved = totalJobs > 0 ? totalSaved / totalJobs : 0;
+
+    res.status(200).json({
+      success: true,
+      totalJobs,
+      totalSaved: parseFloat(totalSaved.toFixed(2)),
+      avgSaved: parseFloat(avgSaved.toFixed(2))
+    });
+
+  } catch (err) {
+    console.error("Error in getUserStats:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch stats",
+      error: err.message
+    });
+  }
+};
+
+module.exports = { getUserStats };
+
+
+module.exports = {
+  createJob,
+  getUserJobs,
+  getUserStats,
 };

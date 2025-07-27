@@ -18,10 +18,12 @@ const jobSchema = new mongoose.Schema({
     scheduledTime: Date,
     status: {
         type: String,
-        enum: ["pending", "running", "completed", "failed"],
+        enum: ["pending", "running", "completed", "failed", "not-executed"],
         default: "pending"
     },
     carbonIntensity: Number,
+    currentIntensity: Number,
+    carbonSaved: Number,         
     carbonEstimate: Number,
     scriptPath: String,
     output: String,
@@ -29,7 +31,6 @@ const jobSchema = new mongoose.Schema({
         type: Date,
         default: Date.now
     }
-    
 });
 
 module.exports = mongoose.model("Job", jobSchema);
