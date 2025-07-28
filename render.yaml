@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: greenpilot-ml-api
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: ELECTRICITY_MAPS_API_TOKEN
+        sync: false
+    disk:
+      name: csv-disk
+      mountPath: /data
+      sizeGB: 1

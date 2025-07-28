@@ -34,7 +34,8 @@ API_TOKEN = os.getenv("ELECTRICITY_MAPS_API_TOKEN")
 # Config
 ZONE = "IN-WE"
 CSV_FILENAME = "IN-WE_hourly.csv"
-CSV_PATH = os.path.join(Path(__file__).parent, CSV_FILENAME)
+CSV_PATH = os.path.join("/data", CSV_FILENAME)
+
 HISTORICAL_HOURS = 90 * 24
 
 # ---------------------- Fetch + Update CSV ---------------------- #
