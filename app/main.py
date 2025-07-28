@@ -1,136 +1,197 @@
-import os
-import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pandas as pd
-from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, Form, File
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
-from dotenv import load_dotenv
-from xgboost import XGBRegressor
-from prophet import Prophet
 import numpy as np
+from prophet import Prophet
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error
+from datetime import timedelta
+from pathlib import Path
+import httpx
+import os
+from dotenv import load_dotenv
+from math import sqrt
+import warnings
+
+warnings.filterwarnings("ignore")
 
 app = FastAPI()
-templates = Jinja2Templates(directory="app/templates")
 
-load_dotenv()
-EM_API_TOKEN = os.getenv("ELECTRICITY_MAPS_API_TOKEN")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-csv_path = "data/IN-WE_hourly.csv"  # ← This must be writable
+# Load environment variables
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
+API_TOKEN = os.getenv("ELECTRICITY_MAPS_API_TOKEN")
+
+# Config
+ZONE = "IN-WE"
+CSV_FILENAME = "IN-WE_hourly.csv"
+CSV_PATH = os.path.join("/app/app", CSV_FILENAME)
 
 
-def fetch_and_update_history():
-    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    past_90_days = now - timedelta(days=90)
+HISTORICAL_HOURS = 90 * 24
 
-    url = f"https://api.electricitymap.org/v3/power-breakdown/history?zone=IN-WE&start={past_90_days.isoformat()}&end={now.isoformat()}"
-    headers = {"auth-token": EM_API_TOKEN}
-    response = requests.get(url, headers=headers)
-    data = response.json()["history"]
+# ---------------------- Fetch + Update CSV ---------------------- #
 
-    df_new = pd.DataFrame([{
-        "Datetime (UTC)": datetime.strptime(point["datetime"], "%Y-%m-%dT%H:%M:%SZ"),
-        "Carbon Intensity": point["carbonIntensity"]
-    } for point in data])
-
+async def fetch_and_update_history(csv_path: str) -> pd.DataFrame:
     if os.path.exists(csv_path):
-        df_existing = pd.read_csv(csv_path)
-        df_existing["Datetime (UTC)"] = pd.to_datetime(df_existing["Datetime (UTC)"])
+        df_existing = pd.read_csv(csv_path, parse_dates=['Datetime (UTC)'])
+        last_timestamp = df_existing['Datetime (UTC)'].max().tz_localize(None)
     else:
-        df_existing = pd.DataFrame(columns=["Datetime (UTC)", "Carbon Intensity"])
+        df_existing = pd.DataFrame()
+        last_timestamp = None
 
-    df_combined = pd.concat([df_existing, df_new], ignore_index=True).drop_duplicates(subset=["Datetime (UTC)"])
-    df_combined = df_combined.sort_values(by="Datetime (UTC)")
+    end = pd.Timestamp.utcnow().floor('h').tz_localize(None)
+    start = end - pd.Timedelta(hours=HISTORICAL_HOURS) if last_timestamp is None else last_timestamp + pd.Timedelta(hours=1)
 
-    # ✅ Ensure directory exists before saving
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    if last_timestamp is not None and start >= end:
+        return df_existing
 
+    url = "https://api.electricitymap.org/v3/carbon-intensity/history"
+    headers = {"auth-token": API_TOKEN}
+    params = {"zone": ZONE, "start": start.isoformat(), "end": end.isoformat()}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json().get("history", [])
+
+    if not data:
+        return df_existing
+
+    df_new = pd.DataFrame([
+        {
+            "Datetime (UTC)": pd.to_datetime(item["datetime"]).tz_localize(None),
+            "Carbon intensity gCO₂eq/kWh (direct)": item.get("carbonIntensity"),
+            "Zone": ZONE
+        } for item in data
+    ]).dropna()
+
+    df_combined = pd.concat([df_existing, df_new], ignore_index=True).drop_duplicates(subset=['Datetime (UTC)'])
+    df_combined = df_combined.sort_values(by='Datetime (UTC)')
     df_combined.to_csv(csv_path, index=False)
     return df_combined
 
+# ---------------------- Fetch Current Intensity ---------------------- #
 
-def create_features(df):
-    df["hour"] = df["Datetime (UTC)"].dt.hour
-    df["dayofweek"] = df["Datetime (UTC)"].dt.dayofweek
-    df["lag_3"] = df["Carbon Intensity"].shift(3)
-    df["lag_6"] = df["Carbon Intensity"].shift(6)
-    df["rolling_12hr"] = df["Carbon Intensity"].rolling(window=12).mean()
-    df["exp_smooth"] = df["Carbon Intensity"].ewm(alpha=0.3).mean()
-    df = df.dropna()
-    return df
+async def fetch_current_intensity() -> float:
+    url = f"https://api.electricitymap.org/v3/carbon-intensity/latest?zone={ZONE}"
+    headers = {"auth-token": API_TOKEN}
 
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
 
-def train_xgb_model(df):
-    df = create_features(df)
-    X = df[["hour", "dayofweek", "lag_3", "lag_6", "rolling_12hr", "exp_smooth"]]
-    y = df["Carbon Intensity"]
-    model = XGBRegressor()
-    model.fit(X, y)
-    return model
+    return data["carbonIntensity"]
 
+# ---------------------- Prediction Endpoint ---------------------- #
 
-def forecast_next_24_hours_xgb(model, df):
-    future_times = [df["Datetime (UTC)"].max() + timedelta(hours=i + 1) for i in range(24)]
-    last_row = df.iloc[-1].copy()
-    future_df = pd.DataFrame({
-        "Datetime (UTC)": future_times,
-        "hour": [dt.hour for dt in future_times],
-        "dayofweek": [dt.dayofweek for dt in future_times],
-    })
-
-    # For lag and rolling features, assume values remain stable for next hours
-    future_df["lag_3"] = last_row["Carbon Intensity"]
-    future_df["lag_6"] = last_row["Carbon Intensity"]
-    future_df["rolling_12hr"] = df["Carbon Intensity"].rolling(window=12).mean().iloc[-1]
-    future_df["exp_smooth"] = df["Carbon Intensity"].ewm(alpha=0.3).mean().iloc[-1]
-
-    X_future = future_df[["hour", "dayofweek", "lag_3", "lag_6", "rolling_12hr", "exp_smooth"]]
-    preds = model.predict(X_future)
-    future_df["Predicted Intensity"] = preds
-    return future_df
-
-
-def forecast_prophet(df):
-    prophet_df = df.rename(columns={"Datetime (UTC)": "ds", "Carbon Intensity": "y"})
-    model = Prophet()
-    model.fit(prophet_df)
-    future = model.make_future_dataframe(periods=24, freq='H')
-    forecast = model.predict(future)
-    return forecast[["ds", "yhat"]].tail(24)
-
+class PredictRequest(BaseModel):
+    duration: int = 1
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), job_name: str = Form(...)):
-    df_history = fetch_and_update_history()
+async def predict_best_time(payload: PredictRequest):
+    try:
+        duration = max(1, min(payload.duration, 24))
 
-    xgb_model = train_xgb_model(df_history)
-    xgb_forecast = forecast_next_24_hours_xgb(xgb_model, df_history)
+        # Update CSV with latest history
+        df = await fetch_and_update_history(CSV_PATH)
+        df = df.rename(columns={
+            "Datetime (UTC)": "datetime",
+            "Carbon intensity gCO₂eq/kWh (direct)": "carbon_intensity"
+        })[['datetime', 'carbon_intensity']]
 
-    prophet_forecast = forecast_prophet(df_history)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime')
 
-    # Merge forecasts
-    merged = xgb_forecast.copy()
-    merged["Prophet Prediction"] = prophet_forecast["yhat"].values
-    merged["Average Intensity"] = merged[["Predicted Intensity", "Prophet Prediction"]].mean(axis=1)
+        # Feature engineering
+        df['hour'] = df['datetime'].dt.hour
+        df['dayofweek'] = df['datetime'].dt.dayofweek
+        df['month'] = df['datetime'].dt.month
+        df['day'] = df['datetime'].dt.day
+        df['is_weekend'] = df['dayofweek'] >= 5
+        df['is_peak'] = df['hour'].between(18, 22)
 
-    best_row = merged.loc[merged["Average Intensity"].idxmin()]
-    best_time = best_row["Datetime (UTC)"].strftime("%Y-%m-%d %H:%M:%S")
-    predicted_intensity = best_row["Average Intensity"]
+        df['lag_1'] = df['carbon_intensity'].shift(1)
+        df['lag_3'] = df['carbon_intensity'].shift(3)
+        df['rolling_6'] = df['carbon_intensity'].rolling(6).mean()
+        df['rolling_12'] = df['carbon_intensity'].rolling(12).mean()
+        df = df.dropna().reset_index(drop=True)
 
-    file_location = f"app/uploads/{file.filename}"
-    os.makedirs(os.path.dirname(file_location), exist_ok=True)
-    with open(file_location, "wb") as f:
-        f.write(await file.read())
+        if df.empty or len(df) < 24:
+            raise ValueError("Not enough data to predict reliably.")
 
-    return {
-        "job_name": job_name,
-        "best_time_to_run": best_time,
-        "predicted_intensity": round(predicted_intensity, 2),
-        "carbon_savings_percent": round(100 * (merged["Average Intensity"].max() - predicted_intensity) / merged["Average Intensity"].max(), 2)
-    }
+        # Split into train + future
+        now = pd.Timestamp.utcnow().floor('h').tz_localize(None)
+        future_dates = pd.date_range(start=now + pd.Timedelta(hours=1), periods=12, freq='H')
+        train_df = df[df['datetime'] < now]
 
+        # Prophet
+        prophet_df = train_df[['datetime', 'carbon_intensity']].rename(columns={'datetime': 'ds', 'carbon_intensity': 'y'})
+        prophet_model = Prophet(daily_seasonality=True, yearly_seasonality=True, weekly_seasonality=True)
+        prophet_model.fit(prophet_df)
+        future_df = pd.DataFrame({'ds': future_dates})
+        prophet_pred = prophet_model.predict(future_df)['yhat'].values
 
-@app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+        # XGBoost
+        features = ['hour', 'dayofweek', 'month', 'day', 'is_weekend', 'is_peak', 'lag_1', 'lag_3', 'rolling_6', 'rolling_12']
+        future_features = pd.DataFrame({'datetime': future_dates})
+        future_features['hour'] = future_features['datetime'].dt.hour
+        future_features['dayofweek'] = future_features['datetime'].dt.dayofweek
+        future_features['month'] = future_features['datetime'].dt.month
+        future_features['day'] = future_features['datetime'].dt.day
+        future_features['is_weekend'] = future_features['dayofweek'] >= 5
+        future_features['is_peak'] = future_features['hour'].between(18, 22)
+
+        latest = df.iloc[-1]
+        future_features['lag_1'] = latest['carbon_intensity']
+        future_features['lag_3'] = latest['carbon_intensity']
+        future_features['rolling_6'] = latest['carbon_intensity']
+        future_features['rolling_12'] = latest['carbon_intensity']
+        future_features = future_features[features]
+
+        xgb_model = XGBRegressor(n_estimators=100, learning_rate=0.1)
+        xgb_model.fit(train_df[features], train_df['carbon_intensity'])
+        xgb_pred = xgb_model.predict(future_features)
+
+        # Ensemble
+        ensemble_pred = []
+        for i in range(len(future_dates)):
+            hour = future_dates[i].hour
+            weight = 0.7 if 0 <= hour < 6 else 0.3
+            combined = weight * prophet_pred[i] + (1 - weight) * xgb_pred[i]
+            ensemble_pred.append(combined)
+
+        ensemble_pred = pd.Series(ensemble_pred, index=future_dates)
+
+        smoothed = ensemble_pred.ewm(span=3).mean()
+        rolling = smoothed.rolling(duration).mean().dropna()
+
+        best_time = rolling.idxmin()
+        predicted_intensity = rolling.min()
+        current_intensity = await fetch_current_intensity()
+        savings = max(0, current_intensity - predicted_intensity)
+
+        decision = "Run now" if current_intensity <= predicted_intensity else "Wait for suggested time"
+
+        return {
+            "best_time": best_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "predicted_intensity": round(predicted_intensity, 2),
+            "current_intensity": round(current_intensity, 2),
+            "savings": round(savings, 2),
+            "recommendation": decision
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)} 
